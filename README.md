@@ -1,7 +1,3 @@
-# anymux
-
----
-
 ## ✨ 特性
 
 - 🚀 **多路复用**：一个 TCP 连接同时运行多个流
@@ -23,7 +19,7 @@ go get github.com/n-yarvex/anymux
 
 ## 🚀 快速开始
 
-### 服务器端
+### 服务端示例
 
 ```go
 package main
@@ -64,7 +60,7 @@ func handleStream(st *anymux.Stream) {
 }
 ```
 
-### 客户端
+### 客户端示例
 
 ```go
 package main
