@@ -12,7 +12,7 @@
 ## 📦 安装
 
 ```
-go get <module-path>/mux
+go get github.com/n-yarvex/anymux
 ```
 
 ---
@@ -29,7 +29,7 @@ import (
 	"log"
 	"net"
 
-	"yourmodule/mux"
+	"n-yarvex/mux"
 )
 
 func main() {
@@ -69,7 +69,7 @@ import (
 	"log"
 	"net"
 
-	"yourmodule/mux"
+	"n-yarvex/mux"
 )
 
 func main() {
