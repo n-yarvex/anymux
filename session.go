@@ -1,379 +1,376 @@
 package mux
-
 import (
-	"encoding/binary"
-	"errors"
-	"io"
-	"log"
-	"net"
-	"strconv"
-	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
+"bytes"
+"encoding/binary"
+"errors"
+"io"
+"net"
+"os"
+"sync"
+"sync/atomic"
+"time"
 )
-
+var (
+ErrSessionClosed = errors.New("mux: session closed")
+ErrStreamClosed  = errors.New("mux: stream closed")
+)
 type Session struct {
-	conn           net.Conn
-	connLock       sync.Mutex
-	streams        map[uint32]*Stream
-	streamId       uint32
-	streamLock     sync.RWMutex
-	dieOnce        sync.Once
-	die            chan struct{}
-	dieHook        func()
-	synDone        func()
-	synDoneLock    sync.Mutex
-	peerVersion    byte
-	isClient       bool
-	onNewStream    func(*Stream)
-	config         Config
-	recvLoopExited chan struct{}
+conn         net.Conn
+config       Config
+isClient     bool
+die          chan struct{}
+dieOnce      sync.Once
+recvExit     chan struct{}
+recvStarted  chan struct{}
+runOnce      sync.Once
+streams      map[uint32]*Stream
+streamsMu    sync.RWMutex
+nextStreamID uint32
+peerVersion  atomic.Uint32
+onNewStream  func(*Stream)
+connLock     sync.Mutex
+writeTimeout time.Duration
+versionCh    chan struct{}
+versionOnce  sync.Once
 }
-
-func NewClientSession(conn net.Conn, config Config) *Session {
-	if config == (Config{}) {
-		config = DefaultConfig
-	}
-	config.MaxFrameSize = clamp(config.MaxFrameSize, 1, 65535)
-	if config.StreamBufferSize <= 0 {
-		config.StreamBufferSize = 64 * 1024
-	}
-	return &Session{
-		conn:           conn,
-		isClient:       true,
-		config:         config,
-		die:            make(chan struct{}),
-		streams:        make(map[uint32]*Stream),
-		recvLoopExited: make(chan struct{}),
-	}
+func NewClientSession(conn net.Conn, cfg Config) *Session {
+cfg = normalizeConfig(cfg)
+return &Session{
+conn:         conn,
+config:       cfg,
+isClient:     true,
+die:          make(chan struct{}),
+recvExit:     make(chan struct{}),
+recvStarted:  make(chan struct{}),
+streams:      make(map[uint32]*Stream),
+writeTimeout: cfg.WriteTimeout,
+versionCh:    make(chan struct{}),
 }
-
-func NewServerSession(conn net.Conn, onNewStream func(*Stream), config Config) *Session {
-	if config == (Config{}) {
-		config = DefaultConfig
-	}
-	config.MaxFrameSize = clamp(config.MaxFrameSize, 1, 65535)
-	if config.StreamBufferSize <= 0 {
-		config.StreamBufferSize = 64 * 1024
-	}
-	return &Session{
-		conn:           conn,
-		onNewStream:    onNewStream,
-		config:         config,
-		die:            make(chan struct{}),
-		streams:        make(map[uint32]*Stream),
-		recvLoopExited: make(chan struct{}),
-	}
 }
-
-func clamp(v, min, max int) int {
-	if v < min {
-		return min
-	}
-	if v > max {
-		return max
-	}
-	return v
+func NewServerSession(conn net.Conn, onNewStream func(*Stream), cfg Config) *Session {
+cfg = normalizeConfig(cfg)
+return &Session{
+conn:         conn,
+config:       cfg,
+isClient:     false,
+die:          make(chan struct{}),
+recvExit:     make(chan struct{}),
+recvStarted:  make(chan struct{}),
+streams:      make(map[uint32]*Stream),
+onNewStream:  onNewStream,
+writeTimeout: cfg.WriteTimeout,
+versionCh:    make(chan struct{}),
 }
-
+}
 func (s *Session) Run() {
-	if !s.isClient {
-		go s.recvLoop()
-		return
-	}
-	f := newFrame(cmdVersionRequest, 0)
-	f.data = []byte("v=2\n")
-	s.writeControlFrame(f)
-	go s.recvLoop()
+s.runOnce.Do(func() {
+go s.recvLoop()
+close(s.recvStarted)
+if s.isClient {
+if err := s.writeFrame(newFrame(cmdSettings, 0, []byte("v=2\n"))); err != nil {
+s.Close()
 }
-
+}
+})
+}
 func (s *Session) IsClosed() bool {
-	select {
-	case <-s.die:
-		return true
-	default:
-		return false
-	}
+select {
+case <-s.die:
+return true
+default:
+return false
 }
-
+}
 func (s *Session) Close() error {
-	var done bool
-	s.dieOnce.Do(func() {
-		close(s.die)
-		done = true
-	})
-	if !done {
-		return ErrSessionClosed
-	}
-	if s.dieHook != nil {
-		s.dieHook()
-		s.dieHook = nil
-	}
-	s.streamLock.Lock()
-	for _, st := range s.streams {
-		st.closeLocally()
-	}
-	s.streams = make(map[uint32]*Stream)
-	s.streamLock.Unlock()
-	s.conn.SetDeadline(time.Now())
-	<-s.recvLoopExited
-	return s.conn.Close()
+var done bool
+s.dieOnce.Do(func() {
+close(s.die)
+done = true
+})
+if !done {
+return nil
 }
-
+s.streamsMu.Lock()
+for _, st := range s.streams {
+st.closeLocked(ErrSessionClosed, false)
+}
+s.streams = make(map[uint32]*Stream)
+s.streamsMu.Unlock()
+s.conn.SetDeadline(time.Now())
+select {
+case <-s.recvStarted:
+select {
+case <-s.recvExit:
+case <-time.After(100 * time.Millisecond):
+}
+default:
+}
+return s.conn.Close()
+}
 func (s *Session) OpenStream() (*Stream, error) {
-	if !s.isClient {
-		return nil, errors.New("mux: only client can open stream")
-	}
-	if s.IsClosed() {
-		return nil, ErrSessionClosed
-	}
-	sid := atomic.AddUint32(&s.streamId, 1)
-	stream := newStream(sid, s)
-	s.streamLock.Lock()
-	if s.IsClosed() {
-		s.streamLock.Unlock()
-		return nil, ErrSessionClosed
-	}
-	s.streams[sid] = stream
-	s.streamLock.Unlock()
-	if _, err := s.writeControlFrame(newFrame(cmdSYN, sid)); err != nil {
-		s.streamLock.Lock()
-		delete(s.streams, sid)
-		s.streamLock.Unlock()
-		stream.closeLocally()
-		return nil, err
-	}
-	if sid >= 2 && s.peerVersion >= 2 {
-		s.synDoneLock.Lock()
-		if s.synDone != nil {
-			s.synDone()
-		}
-		s.synDone = newDeadlineWatcher(s.config.HandshakeTimeout, func() { s.Close() })
-		s.synDoneLock.Unlock()
-	}
-	return stream, nil
+if !s.isClient {
+return nil, errors.New("mux: server cannot open stream")
 }
-
+if s.IsClosed() {
+return nil, ErrSessionClosed
+}
+if s.peerVersion.Load() < 2 {
+timer := time.NewTimer(s.config.HandshakeTimeout)
+defer timer.Stop()
+select {
+case <-s.versionCh:
+case <-s.die:
+return nil, ErrSessionClosed
+case <-timer.C:
+return nil, errors.New("mux: version negotiation timeout")
+}
+}
+sid := atomic.AddUint32(&s.nextStreamID, 1)
+st := newStream(sid, s)
+s.streamsMu.Lock()
+if s.IsClosed() {
+s.streamsMu.Unlock()
+return nil, ErrSessionClosed
+}
+s.streams[sid] = st
+s.streamsMu.Unlock()
+if err := s.writeFrame(newFrame(cmdSYN, sid, nil)); err != nil {
+s.streamsMu.Lock()
+delete(s.streams, sid)
+s.streamsMu.Unlock()
+st.closeLocked(err, false)
+return nil, err
+}
+return st, nil
+}
+func (s *Session) writeDataFrame(sid uint32, data []byte, deadline *PipeDeadline) (int, error) {
+if len(data) == 0 {
+return 0, nil
+}
+max := s.config.MaxFrameSize
+if max <= 0 {
+max = 64 * 1024
+}
+total := len(data)
+written := 0
+for written < total {
+if deadline != nil && deadline.Expired() {
+return written, os.ErrDeadlineExceeded
+}
+chunk := data[written:]
+if len(chunk) > max {
+chunk = chunk[:max]
+}
+f := newFrame(cmdPSH, sid, chunk)
+if err := s.writeFrame(f); err != nil {
+return written, err
+}
+written += len(chunk)
+}
+return written, nil
+}
+func (s *Session) writeFrame(f frame) error {
+if len(f.data) > 65535 {
+f.data = f.data[:65535]
+}
+length := len(f.data)
+total := 7 + length
+buf := getFrameBuf(total)
+buf[0] = f.cmd
+binary.BigEndian.PutUint32(buf[1:5], f.sid)
+binary.BigEndian.PutUint16(buf[5:7], uint16(length))
+if length > 0 {
+copy(buf[7:], f.data)
+}
+s.connLock.Lock()
+if s.writeTimeout > 0 {
+s.conn.SetWriteDeadline(time.Now().Add(s.writeTimeout))
+}
+n, err := s.conn.Write(buf)
+if s.writeTimeout > 0 {
+s.conn.SetWriteDeadline(time.Time{})
+}
+s.connLock.Unlock()
+putFrameBuf(buf)
+if n < len(buf) {
+s.Close()
+if err == nil {
+err = io.ErrShortWrite
+}
+}
+return err
+}
+func (s *Session) streamClosed(sid uint32) {
+s.streamsMu.Lock()
+delete(s.streams, sid)
+s.streamsMu.Unlock()
+}
 func (s *Session) recvLoop() {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("mux: recvLoop panic: %v", r)
-		}
-		close(s.recvLoopExited)
-		s.Close()
-	}()
-	var hdr rawHeader
-	var settingsReceived bool
-	for {
-		if s.IsClosed() {
-			return
-		}
-		_, err := io.ReadFull(s.conn, hdr[:])
-		if err != nil {
-			return
-		}
-		sid := hdr.Sid()
-		length := int(hdr.Len())
-		if length > s.config.MaxFrameSize {
-			io.CopyN(io.Discard, s.conn, int64(length))
-			continue
-		}
-		switch hdr.Cmd() {
-		case cmdPSH:
-			if length > 0 {
-				buf := make([]byte, length)
-				if _, err := io.ReadFull(s.conn, buf); err != nil {
-					return
-				}
-				s.streamLock.RLock()
-				st, ok := s.streams[sid]
-				s.streamLock.RUnlock()
-				if ok {
-					_ = st.pushData(buf)
-				}
-			}
-		case cmdSYN:
-			if !s.isClient && !settingsReceived {
-				f := newFrame(cmdError, 0)
-				f.data = []byte("settings missing")
-				s.writeControlFrame(f)
-				return
-			}
-			s.streamLock.Lock()
-			if _, ok := s.streams[sid]; !ok {
-				st := newStream(sid, s)
-				s.streams[sid] = st
-				if s.onNewStream != nil {
-					go s.onNewStream(st)
-				} else {
-					st.Close()
-				}
-			}
-			s.streamLock.Unlock()
-		case cmdSYNACK:
-			s.synDoneLock.Lock()
-			if s.synDone != nil {
-				s.synDone()
-				s.synDone = nil
-			}
-			s.synDoneLock.Unlock()
-			if length > 0 {
-				buf := make([]byte, length)
-				if _, err := io.ReadFull(s.conn, buf); err != nil {
-					return
-				}
-				s.streamLock.RLock()
-				st, ok := s.streams[sid]
-				s.streamLock.RUnlock()
-				if ok {
-					st.closeWithError(&streamError{msg: string(buf)}, false)
-				}
-			}
-		case cmdFIN:
-			s.streamLock.Lock()
-			st, ok := s.streams[sid]
-			delete(s.streams, sid)
-			s.streamLock.Unlock()
-			if ok {
-				st.closeLocally()
-			}
-		case cmdVersionRequest:
-			if length > 0 {
-				buf := make([]byte, length)
-				if _, err := io.ReadFull(s.conn, buf); err != nil {
-					return
-				}
-				if !s.isClient {
-					settingsReceived = true
-					m := parseStringMap(buf)
-					if v, _ := strconv.Atoi(m["v"]); v >= 2 {
-						s.peerVersion = byte(v)
-						f := newFrame(cmdVersionResponse, 0)
-						f.data = []byte("v=2\n")
-						s.writeControlFrame(f)
-					}
-				}
-			}
-		case cmdVersionResponse:
-			if length > 0 {
-				buf := make([]byte, length)
-				if _, err := io.ReadFull(s.conn, buf); err != nil {
-					return
-				}
-				if s.isClient {
-					m := parseStringMap(buf)
-					if v, _ := strconv.Atoi(m["v"]); v >= 2 {
-						s.peerVersion = byte(v)
-					}
-				}
-			}
-		default:
-			if length > 0 {
-				io.CopyN(io.Discard, s.conn, int64(length))
-			}
-		}
-	}
+defer func() {
+close(s.recvExit)
+s.Close()
+}()
+var hdr rawHeader
+settingsReceived := false
+for {
+if s.IsClosed() {
+return
 }
-
-func (s *Session) streamClosed(sid uint32) error {
-	if s.IsClosed() {
-		return ErrSessionClosed
-	}
-	s.streamLock.Lock()
-	_, ok := s.streams[sid]
-	if !ok {
-		s.streamLock.Unlock()
-		return nil
-	}
-	delete(s.streams, sid)
-	s.streamLock.Unlock()
-	_, err := s.writeControlFrame(newFrame(cmdFIN, sid))
-	return err
+_, err := io.ReadFull(s.conn, hdr[:])
+if err != nil {
+return
 }
-
-func (s *Session) writeDataFrame(sid uint32, data []byte) (int, error) {
-	total := len(data)
-	if total == 0 {
-		return 0, nil
-	}
-	maxPayload := s.config.MaxFrameSize
-	written := 0
-	for written < total {
-		chunkSize := total - written
-		if chunkSize > maxPayload {
-			chunkSize = maxPayload
-		}
-		chunk := data[written : written+chunkSize]
-		buf := make([]byte, 7+chunkSize)
-		buf[0] = cmdPSH
-		binary.BigEndian.PutUint32(buf[1:5], sid)
-		binary.BigEndian.PutUint16(buf[5:7], uint16(chunkSize))
-		copy(buf[7:], chunk)
-		s.conn.SetWriteDeadline(time.Now().Add(s.config.WriteTimeout))
-		if _, err := s.writeConn(buf); err != nil {
-			s.conn.SetWriteDeadline(time.Time{})
-			return written, err
-		}
-		written += chunkSize
-	}
-	s.conn.SetWriteDeadline(time.Time{})
-	return written, nil
+length := int(hdr.Len())
+if length > s.config.MaxFrameSize {
+if _, err := io.CopyN(io.Discard, s.conn, int64(length)); err != nil {
+return
 }
-
-func (s *Session) writeControlFrame(f frame) (int, error) {
-	ln := len(f.data)
-	if ln > 65535 {
-		ln = 65535
-		f.data = f.data[:ln]
-	}
-	buf := make([]byte, 7+ln)
-	buf[0] = f.cmd
-	binary.BigEndian.PutUint32(buf[1:5], f.sid)
-	binary.BigEndian.PutUint16(buf[5:7], uint16(ln))
-	copy(buf[7:], f.data)
-	s.conn.SetWriteDeadline(time.Now().Add(s.config.WriteTimeout))
-	_, err := s.writeConn(buf)
-	s.conn.SetWriteDeadline(time.Time{})
-	if err != nil {
-		s.Close()
-	}
-	return ln, err
+continue
 }
-
-func (s *Session) writeConn(b []byte) (int, error) {
-	s.connLock.Lock()
-	defer s.connLock.Unlock()
-	return s.conn.Write(b)
+var payload []byte
+if length > 0 {
+payload = getPayloadBuf(length)
+if _, err := io.ReadFull(s.conn, payload); err != nil {
+putPayloadBuf(payload)
+return
 }
-
-func parseStringMap(b []byte) map[string]string {
-	m := make(map[string]string)
-	lines := strings.Split(string(b), "\n")
-	for _, line := range lines {
-		kv := strings.SplitN(line, "=", 2)
-		if len(kv) == 2 {
-			m[kv[0]] = kv[1]
-		}
-	}
-	return m
 }
-
-func newDeadlineWatcher(d time.Duration, onTimeout func()) func() {
-	t := time.NewTimer(d)
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-done:
-			t.Stop()
-		case <-t.C:
-			onTimeout()
-		}
-	}()
-	var once sync.Once
-	return func() { once.Do(func() { close(done) }) }
+cmd := hdr.Cmd()
+sid := hdr.Sid()
+switch cmd {
+case cmdWaste:
+case cmdPSH:
+if length == 0 {
+break
 }
-
-type streamError struct{ msg string }
-
-func (e *streamError) Error() string { return e.msg }
+s.streamsMu.RLock()
+st, ok := s.streams[sid]
+s.streamsMu.RUnlock()
+if ok {
+if !st.pushData(payload) {
+select {
+case <-st.closeCh:
+default:
+st.closeLocked(errors.New("mux: receive buffer overflow"), true)
+}
+}
+}
+case cmdSYN:
+if !s.isClient && !settingsReceived {
+if err := s.writeFrame(newFrame(cmdAlert, 0, []byte("settings missing"))); err != nil {
+putPayloadBuf(payload)
+return
+}
+putPayloadBuf(payload)
+return
+}
+s.streamsMu.Lock()
+if _, ok := s.streams[sid]; !ok {
+st := newStream(sid, s)
+s.streams[sid] = st
+if s.onNewStream != nil {
+go s.onNewStream(st)
+} else {
+delete(s.streams, sid)
+st.closeLocked(io.EOF, false)
+go s.writeFrame(newFrame(cmdSYNACK, sid, []byte("stream rejected")))
+go s.writeFrame(newFrame(cmdFIN, sid, nil))
+}
+}
+s.streamsMu.Unlock()
+case cmdSYNACK:
+s.streamsMu.RLock()
+st, ok := s.streams[sid]
+s.streamsMu.RUnlock()
+if ok {
+st.stopHandshakeTimer()
+if length > 0 {
+hErr := errors.New("mux: " + string(payload))
+st.setHandshakeError(hErr)
+st.closeLocked(hErr, false)
+s.streamClosed(sid)
+}
+}
+case cmdFIN:
+s.streamsMu.Lock()
+st, ok := s.streams[sid]
+if ok {
+delete(s.streams, sid)
+}
+s.streamsMu.Unlock()
+if ok {
+st.closeLocked(io.EOF, false)
+}
+case cmdSettings:
+if !s.isClient {
+settingsReceived = true
+m := parseMap(payload)
+if v, ok := m["v"]; ok && v == "2" {
+s.peerVersion.Store(2)
+if err := s.writeFrame(newFrame(cmdServerSettings, 0, []byte("v=2\n"))); err != nil {
+putPayloadBuf(payload)
+return
+}
+} else {
+if err := s.writeFrame(newFrame(cmdAlert, 0, []byte("unsupported version"))); err != nil {
+putPayloadBuf(payload)
+return
+}
+putPayloadBuf(payload)
+return
+}
+}
+case cmdServerSettings:
+if s.isClient {
+m := parseMap(payload)
+if v, ok := m["v"]; ok && v == "2" {
+s.peerVersion.Store(2)
+s.versionOnce.Do(func() {
+close(s.versionCh)
+})
+s.streamsMu.RLock()
+for _, st := range s.streams {
+if st.id >= 1 {
+st.setHandshakeTimer(s.config.HandshakeTimeout)
+}
+}
+s.streamsMu.RUnlock()
+} else {
+if err := s.writeFrame(newFrame(cmdAlert, 0, []byte("unsupported version"))); err != nil {
+putPayloadBuf(payload)
+return
+}
+putPayloadBuf(payload)
+return
+}
+}
+case cmdAlert:
+putPayloadBuf(payload)
+return
+case cmdHeartRequest:
+if err := s.writeFrame(newFrame(cmdHeartResponse, sid, nil)); err != nil {
+putPayloadBuf(payload)
+return
+}
+case cmdHeartResponse:
+default:
+}
+if payload != nil {
+putPayloadBuf(payload)
+}
+}
+}
+func parseMap(b []byte) map[string]string {
+m := make(map[string]string)
+for _, line := range bytes.Split(b, []byte("\n")) {
+line = bytes.TrimSpace(line)
+if len(line) == 0 {
+continue
+}
+kv := bytes.SplitN(line, []byte("="), 2)
+if len(kv) == 2 {
+m[string(bytes.TrimSpace(kv[0]))] = string(bytes.TrimSpace(kv[1]))
+}
+}
+return m
+}
